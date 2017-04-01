@@ -29,6 +29,8 @@ if system == 'Darwin':
     libname = 'libportaudio.dylib'
 elif system == 'Windows':
     libname = 'libportaudio' + architecture0 + '.dll'
+    libname = "portaudio.dll"
+    print('libname =', libname)
 else:
     libname = None
 
