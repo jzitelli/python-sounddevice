@@ -23,7 +23,7 @@
 http://python-sounddevice.readthedocs.io/
 
 """
-__version__ = '0.3.7'
+__version__ = '0.3.8'
 
 import atexit as _atexit
 from cffi import FFI as _FFI
@@ -231,6 +231,33 @@ signed long Pa_GetStreamWriteAvailable( PaStream* stream );
 PaHostApiTypeId Pa_GetStreamHostApiType( PaStream* stream );
 PaError Pa_GetSampleSize( PaSampleFormat format );
 void Pa_Sleep( long msec );
+
+/* pa_mac_core.h */
+
+typedef int32_t SInt32;
+typedef struct
+{
+    unsigned long size;
+    PaHostApiTypeId hostApiType;
+    unsigned long version;
+    unsigned long flags;
+    SInt32 const * channelMap;
+    unsigned long channelMapSize;
+} PaMacCoreStreamInfo;
+void PaMacCore_SetupStreamInfo( PaMacCoreStreamInfo *data, unsigned long flags );
+void PaMacCore_SetupChannelMap( PaMacCoreStreamInfo *data, const SInt32 * const channelMap, unsigned long channelMapSize );
+const char *PaMacCore_GetChannelName( int device, int channelIndex, bool input );
+#define paMacCoreChangeDeviceParameters 0x01
+#define paMacCoreFailIfConversionRequired 0x02
+#define paMacCoreConversionQualityMin    0x0100
+#define paMacCoreConversionQualityMedium 0x0200
+#define paMacCoreConversionQualityLow    0x0300
+#define paMacCoreConversionQualityHigh   0x0400
+#define paMacCoreConversionQualityMax    0x0000
+#define paMacCorePlayNice                    0x00
+#define paMacCorePro                         0x01
+#define paMacCoreMinimizeCPUButPlayNice      0x0100
+#define paMacCoreMinimizeCPU                 0x0101
 
 /* pa_win_waveformat.h */
 
@@ -517,7 +544,7 @@ def playrec(data, samplerate=None, channels=None, dtype=None,
     input_frames = ctx.check_out(out, output_frames, channels, dtype,
                                  input_mapping)
     if input_frames != output_frames:
-        raise PortAudioError('len(data) != len(out)')
+        raise ValueError('len(data) != len(out)')
     ctx.frames = input_frames
 
     def callback(indata, outdata, frames, time, status):
@@ -536,7 +563,7 @@ def playrec(data, samplerate=None, channels=None, dtype=None,
     return ctx.out
 
 
-def wait():
+def wait(ignore_errors=True):
     """Wait for `play()`/`rec()`/`playrec()` to be finished.
 
     Playback/recording can be stopped with a `KeyboardInterrupt`.
@@ -553,7 +580,7 @@ def wait():
 
     """
     if _last_callback:
-        return _last_callback.wait()
+        return _last_callback.wait(ignore_errors)
 
 
 def stop(ignore_errors=True):
@@ -565,6 +592,9 @@ def stop(ignore_errors=True):
 
     """
     if _last_callback:
+        # Calling stop() before close() is necessary for older PortAudio
+        # versions, see issue #87:
+        _last_callback.stream.stop(ignore_errors)
         _last_callback.stream.close(ignore_errors)
 
 
@@ -924,7 +954,7 @@ class _StreamBase(object):
             self._channels = iparameters.channelCount, oparameters.channelCount
             self._samplesize = isize, osize
             if isamplerate != osamplerate:
-                raise PortAudioError(
+                raise ValueError(
                     'Input and output device must have the same samplerate')
             else:
                 samplerate = isamplerate
@@ -1219,7 +1249,7 @@ class _StreamBase(object):
         if err != _lib.paStreamIsNotStopped:
             _check(err, 'Error starting stream')
 
-    def stop(self):
+    def stop(self, ignore_errors=True):
         """Terminate audio processing.
 
         This waits until all pending audio buffers have been played
@@ -1231,10 +1261,10 @@ class _StreamBase(object):
 
         """
         err = _lib.Pa_StopStream(self._ptr)
-        if err != _lib.paStreamIsStopped:
+        if not ignore_errors:
             _check(err, 'Error stopping stream')
 
-    def abort(self):
+    def abort(self, ignore_errors=True):
         """Terminate audio processing immediately.
 
         This does not wait for pending buffers to complete.
@@ -1245,7 +1275,7 @@ class _StreamBase(object):
 
         """
         err = _lib.Pa_AbortStream(self._ptr)
-        if err != _lib.paStreamIsStopped:
+        if not ignore_errors:
             _check(err, 'Error aborting stream')
 
     def close(self, ignore_errors=True):
@@ -2182,7 +2212,7 @@ class default(object):
 
     See Also
     --------
-    AsioSettings, WasapiSettings
+    AsioSettings, CoreAudioSettings, WasapiSettings
 
     """
     samplerate = None
@@ -2262,13 +2292,39 @@ class default(object):
         vars(self).clear()
         self.__init__()
 
+
 if not hasattr(_ffi, 'I_AM_FAKE'):
     # This object shadows the 'default' class, except when building the docs.
     default = default()
 
 
 class PortAudioError(Exception):
-    """This exception will be raised on PortAudio errors."""
+    """This exception will be raised on PortAudio errors.
+
+    Attributes
+    ----------
+    args
+        A variable length tuple containing the following elements when
+        available:
+
+        1) A string describing the error
+        2) The PortAudio ``PaErrorCode`` value
+        3) A 3-tuple containing the host API index, host error code, and the
+           host error message (which may be an empty string)
+
+    """
+
+    def __str__(self):
+        errormsg = self.args[0] if self.args else ''
+        if len(self.args) > 1:
+            errormsg = "{0} [PaErrorCode {1}]".format(errormsg, self.args[1])
+        if len(self.args) > 2:
+            host_api, hosterror_code, hosterror_text = self.args[2]
+            hostname = query_hostapis(host_api)['name']
+            errormsg = "{0}: '{1}' [{2} error {3}]".format(
+                errormsg, hosterror_text, hostname, hosterror_code)
+
+        return errormsg
 
 
 class CallbackStop(Exception):
@@ -2347,6 +2403,98 @@ class AsioSettings(object):
             version=1,
             flags=_lib.paAsioUseChannelSelectors,
             channelSelectors=self._selectors))
+
+
+class CoreAudioSettings(object):
+
+    def __init__(self, channel_map=None, change_device_parameters=False,
+                 fail_if_conversion_required=False, conversion_quality='max'):
+        """Mac Core Audio-specific input/output settings.
+
+        Objects of this class can be used as *extra_settings* argument
+        to `Stream()` (and variants) or as `default.extra_settings`.
+
+        Parameters
+        ----------
+        channel_map : sequence of int, optional
+            Support for opening only specific channels of a Core Audio
+            device.  Note that *channel_map* is treated differently
+            between input and output channels.
+
+            For input devices, *channel_map* is a list of integers
+            specifying the (zero-based) channel numbers to use.
+
+            For output devices, *channel_map* must have the same length
+            as the number of output channels of the device.  Specify
+            unused channels with -1, and a 0-based index for any desired
+            channels.
+
+            See the example below.  For additional information, see the
+            `PortAudio documentation`__.
+
+            __ https://app.assembla.com/spaces/portaudio/git/source/
+               master/src/hostapi/coreaudio/notes.txt
+        change_device_parameters : bool, optional
+            If ``True``, allows PortAudio to change things like the
+            device's frame size, which allows for much lower latency,
+            but might disrupt the device if other programs are using it,
+            even when you are just querying the device.  ``False`` is
+            the default.
+        fail_if_conversion_required : bool, optional
+            In combination with the above flag, ``True`` causes the
+            stream opening to fail, unless the exact sample rates are
+            supported by the device.
+        conversion_quality : {'min', 'low', 'medium', 'high', 'max'}, optional
+            This sets Core Audio's sample rate conversion quality.
+            ``'max'`` is the default.
+
+        Example
+        -------
+        This example assumes a device having 6 input and 6 output
+        channels.  Input is from the second and fourth channels, and
+        output is to the device's third and fifth channels:
+
+        >>> import sounddevice as sd
+        >>> ca_in = sd.CoreAudioSettings(channel_map=[1, 3])
+        >>> ca_out = sd.CoreAudioSettings(channel_map=[-1, -1, 0, -1, 1, -1])
+        >>> sd.playrec(..., channels=2, extra_settings=(ca_in, ca_out))
+
+        """
+        conversion_dict = {
+            'min':    _lib.paMacCoreConversionQualityMin,
+            'low':    _lib.paMacCoreConversionQualityLow,
+            'medium': _lib.paMacCoreConversionQualityMedium,
+            'high':   _lib.paMacCoreConversionQualityHigh,
+            'max':    _lib.paMacCoreConversionQualityMax,
+        }
+
+        # Minimal checking on channel_map to catch errors that might
+        # otherwise go unnoticed:
+        if isinstance(channel_map, int):
+            raise TypeError('channel_map must be a list or tuple')
+
+        try:
+            self._flags = conversion_dict[conversion_quality.lower()]
+        except (KeyError, AttributeError):
+            raise ValueError('conversion_quality must be one of ' +
+                             repr(list(conversion_dict)))
+        if change_device_parameters:
+            self._flags |= _lib.paMacCoreChangeDeviceParameters
+        if fail_if_conversion_required:
+            self._flags |= _lib.paMacCoreFailIfConversionRequired
+
+        # this struct must be kept alive!
+        self._streaminfo = _ffi.new('PaMacCoreStreamInfo*')
+        _lib.PaMacCore_SetupStreamInfo(self._streaminfo, self._flags)
+
+        if channel_map is not None:
+            # this array must be kept alive!
+            self._channel_map = _ffi.new('SInt32[]', channel_map)
+            if len(self._channel_map) == 0:
+                raise TypeError('channel_map must not be empty')
+            _lib.PaMacCore_SetupChannelMap(self._streaminfo,
+                                           self._channel_map,
+                                           len(self._channel_map))
 
 
 class WasapiSettings(object):
@@ -2530,7 +2678,7 @@ class _CallbackContext(object):
         if blocking:
             self.wait()
 
-    def wait(self):
+    def wait(self, ignore_errors=True):
         """Wait for finished_callback.
 
         Can be interrupted with a KeyboardInterrupt.
@@ -2539,7 +2687,7 @@ class _CallbackContext(object):
         try:
             self.event.wait()
         finally:
-            self.stream.close()
+            self.stream.close(ignore_errors)
         return self.status if self.status else None
 
 
@@ -2657,19 +2805,27 @@ def _split(value):
     return invalue, outvalue
 
 
-def _check(err, msg=""):
-    """Raise error for non-zero error codes."""
-    if err < 0:
-        msg += ': ' if msg else ''
-        if err == _lib.paUnanticipatedHostError:
-            info = _lib.Pa_GetLastHostErrorInfo()
-            hostapi = _lib.Pa_HostApiTypeIdToHostApiIndex(info.hostApiType)
-            msg += 'Unanticipated host API {0} error {1}: {2!r}'.format(
-                hostapi, info.errorCode, _ffi.string(info.errorText).decode())
-        else:
-            msg += _ffi.string(_lib.Pa_GetErrorText(err)).decode()
-        raise PortAudioError(msg)
-    return err
+def _check(err, msg=''):
+    """Raise PortAudioError for below-zero error codes."""
+    if err >= 0:
+        return err
+
+    errormsg = _ffi.string(_lib.Pa_GetErrorText(err)).decode()
+    if msg:
+        errormsg = "{0}: {1}".format(msg, errormsg)
+
+    if err == _lib.paUnanticipatedHostError:
+        # (gh82) We grab the host error info here rather than inside
+        # PortAudioError since _check should only ever be called after a
+        # failing API function call. This way we can avoid any potential issues
+        # in scenarios where multiple APIs are being used simultaneously.
+        info = _lib.Pa_GetLastHostErrorInfo()
+        host_api = _lib.Pa_HostApiTypeIdToHostApiIndex(info.hostApiType)
+        hosterror_text = _ffi.string(info.errorText).decode()
+        hosterror_info = host_api, info.errorCode, hosterror_text
+        raise PortAudioError(errormsg, err, hosterror_info)
+
+    raise PortAudioError(errormsg, err)
 
 
 def _get_device_id(id_or_query_string, kind, raise_on_error=False):
